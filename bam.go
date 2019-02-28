@@ -32,16 +32,6 @@ type AlignmentMap struct {
 	Alignments []*bamAlignment
 }
 
-type bgzfByteReader struct {
-	*os.File
-	x [1]byte
-}
-
-func (f *bgzfByteReader) ReadByte() (byte, error) {
-	_, err := f.Read(f.x[:])
-	return f.x[0], err
-}
-
 // Load a BAM dataset from the file.
 func Load(filename string) (*AlignmentMap, error) {
 	ff, err := os.Open(filename)
