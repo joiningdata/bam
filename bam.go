@@ -14,6 +14,16 @@ import (
 	"strings"
 )
 
+var (
+	// MaxBAMMemory is the (approximate) maximum memory usage per BAM file.
+	// Default value is 500MB.
+	MaxBAMMemory int64 = 500 * 1024 * 1024
+
+	// MaxBAMCachedBlocks is (approximately) how many block to keep in memory.
+	// With default 500MB limit, this value is 8000.
+	MaxBAMCachedBlocks = MaxBAMMemory / 65536
+)
+
 var bgzfEOF = []byte{
 	0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff,
 	6, 0, 0x42, 0x43, 2, 0, 0x1b, 0, 3, 0,
@@ -22,7 +32,13 @@ var bgzfEOF = []byte{
 
 // An AlignmentMap represents a sequence alignment/map.
 type AlignmentMap struct {
-	blockCache map[int64][]byte
+	filename string
+	f        *os.File
+	z        *gzip.Reader
+	partial  bool
+
+	blocks       blockCache
+	blockAdvance map[int64]uint16 // how much to move forward in the compressed file to get the start of the next block
 
 	Index *Index
 
@@ -38,12 +54,17 @@ func Load(filename string) (*AlignmentMap, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &AlignmentMap{}
-	f.blockCache = make(map[int64][]byte)
+	f := &AlignmentMap{
+		filename: filename,
+		f:        ff,
+	}
+
+	// recalc just in case mem limit changed
+	MaxBAMCachedBlocks = MaxBAMMemory / 65536
 
 	/////////
 	// check for proper End-of-file marker
-	_, err = ff.Seek(-int64(len(bgzfEOF)), io.SeekEnd)
+	sz, err := ff.Seek(-int64(len(bgzfEOF)), io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -62,18 +83,27 @@ func Load(filename string) (*AlignmentMap, error) {
 	}
 	/////////
 	bff := bufio.NewReader(ff)
-	zr, err := gzip.NewReader(bff)
+	f.z, err = gzip.NewReader(bff)
 	if err != nil {
 		ff.Close()
 		return nil, err
 	}
 
+	numBlocks := sz / 65535
+	if numBlocks > MaxBAMCachedBlocks {
+		f.blocks = newLRUCache(int(MaxBAMCachedBlocks))
+		f.partial = true
+	} else {
+		f.blocks = newMapCache(int(numBlocks))
+	}
+	f.blockAdvance = make(map[int64]uint16, numBlocks)
+
 	var remainder []byte
 	completeHeader := false
 	truepos := int64(0)
 	for {
-		zr.Multistream(false)
-		h := zr.Header
+		f.z.Multistream(false)
+		h := f.z.Header
 		if h.Extra[0] != 'B' || h.Extra[1] != 'C' {
 			panic("not a BAM file (invalid subfield id)")
 		}
@@ -81,21 +111,24 @@ func Load(filename string) (*AlignmentMap, error) {
 			panic("not a BAM file (invalid subfield length)")
 		}
 		bsize := binary.LittleEndian.Uint16(h.Extra[4:]) + 1
+		f.blockAdvance[truepos] = bsize
 
 		/// read the data here
-		data, err := ioutil.ReadAll(zr)
+		data, err := ioutil.ReadAll(f.z)
 		if err != nil {
-			zr.Close()
+			f.z.Close()
 			ff.Close()
 			return nil, err
 		}
 
-		f.blockCache[truepos] = data
+		if !f.partial {
+			f.blocks.Set(truepos, data)
+		}
 
 		if len(remainder) > 0 {
 			// copy the partial block from the last chunk to
 			// the beginning of this one.
-			newchunk := make([]byte, len(remainder))
+			newchunk := make([]byte, len(remainder), len(data)+len(remainder))
 			copy(newchunk, remainder)
 			data = append(newchunk, data...)
 		}
@@ -103,6 +136,10 @@ func Load(filename string) (*AlignmentMap, error) {
 		if !completeHeader {
 			// parse the header + initial block
 			remainder, completeHeader = f.parseHead(data[:])
+
+			if f.partial && completeHeader {
+				break
+			}
 		} else {
 			remainder = f.parseNext(data)
 		}
@@ -113,14 +150,18 @@ func Load(filename string) (*AlignmentMap, error) {
 		bff.Reset(ff)
 
 		// move to the next chunk
-		err = zr.Reset(bff)
+		err = f.z.Reset(bff)
 		if err == io.EOF {
 			break
 		}
 	}
 
-	zr.Close()
-	ff.Close()
+	if !f.partial {
+		f.z.Close()
+		ff.Close()
+		f.f = nil
+		f.z = nil
+	}
 	f.Index, err = LoadIndex(filename + ".bai")
 	if os.IsNotExist(err) {
 		log.Println("warning: no index available for", filename)
@@ -336,12 +377,88 @@ func parseAlignment(r []byte) *bamAlignment {
 	return b
 }
 
+func (b *AlignmentMap) loadBlock(bid int64, atoffset uint16) []byte {
+	log.Println("load block ", bid, "at", atoffset)
+	_, err := b.f.Seek(bid, io.SeekStart)
+	if err != nil {
+		panic(err)
+	}
+
+	err = b.z.Reset(b.f)
+	if err != nil {
+		panic(err)
+	}
+	b.z.Multistream(false)
+	bsize := binary.LittleEndian.Uint16(b.z.Header.Extra[4:]) + 1
+	b.blockAdvance[bid] = bsize
+
+	data, err := ioutil.ReadAll(b.z)
+	if err != nil {
+		panic(err)
+	}
+
+	if !b.partial {
+		b.blocks.Set(bid, data)
+	}
+
+	return data[atoffset:]
+}
+
+func (b *AlignmentMap) noindexGetMap(refID int32, beginPos, endPos uint64) []string {
+	var result []string
+	ref := b.References[refID]
+	if beginPos > uint64(ref.Length) || endPos > uint64(ref.Length) {
+		panic("invalid range")
+	}
+	if b.partial {
+		panic("bam file is too large - please index it")
+	}
+	///
+
+	for _, ba := range b.Alignments {
+		if ba.refID != refID {
+			continue
+		}
+		// alignment is actually in range?
+		if ba.pos+ba.tlen >= int32(beginPos) &&
+			ba.pos <= int32(endPos) {
+
+			seq := UnpackSequence(ba.seqPacked)
+			px := int(ba.pos) - int(beginPos)
+			pad := ""
+			if px > 0 {
+				pad = strings.Repeat(" ", px)
+			} else {
+				px = -px
+				if px >= len(seq) {
+					seq = ""
+				} else {
+					seq = seq[px:]
+				}
+			}
+			seq = pad + seq
+			epad := int(endPos - beginPos)
+			if len(seq) > epad {
+				seq = seq[:epad]
+			} else {
+				seq = seq + strings.Repeat(" ", epad-len(seq))
+			}
+			result = append(result, seq)
+		}
+	}
+
+	return result
+}
+
 // GetMap returns an alignment of the region.
 func (b *AlignmentMap) GetMap(refID int32, beginPos, endPos uint64) []string {
 	var result []string
 	ref := b.References[refID]
 	if beginPos > uint64(ref.Length) || endPos > uint64(ref.Length) {
 		panic("invalid range")
+	}
+	if b.Index == nil {
+		return b.noindexGetMap(refID, beginPos, endPos)
 	}
 	iref := b.Index.Refs[refID]
 	bid := iref.getBin(beginPos, endPos)
@@ -354,10 +471,17 @@ func (b *AlignmentMap) GetMap(refID int32, beginPos, endPos uint64) []string {
 
 		done := false
 		var remainder []byte
-		for pi := p1; pi <= p2; pi++ {
-			r := b.blockCache[pi][po:]
+		for pi := p1; pi <= p2; {
+			r, ok := b.blocks.Get(pi)
+			if !ok {
+				log.Println(p1, pi, p2)
+				r = b.loadBlock(pi, po)
+			} else {
+				r = r[po:]
+			}
+			pi += int64(b.blockAdvance[pi])
 			if len(remainder) > 0 {
-				newchunk := make([]byte, len(remainder))
+				newchunk := make([]byte, len(remainder), len(r)+len(remainder))
 				copy(newchunk, remainder)
 				newchunk = append(newchunk, r...)
 				r = newchunk

@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joiningdata/bam"
@@ -23,12 +25,41 @@ func commas(n int) string {
 }
 
 func main() {
+	maxmem := flag.String("m", "500M", "maximum memory size to use")
 	listRefs := flag.Bool("l", false, "list reference sequence info")
 	listBins := flag.Bool("lb", false, "list bin details for each reference sequence")
 	refName := flag.String("r", "", "query named reference only")
 	startPos := flag.Int64("s", 0, "start position for alignment map (0-based)")
 	endPos := flag.Int64("e", -1, "end position for alignment map (0-based)")
 	flag.Parse()
+
+	*maxmem = strings.ToUpper(*maxmem)
+	*maxmem = strings.TrimSuffix(*maxmem, "B")
+	if *maxmem != "500M" {
+		lc := (*maxmem)[len(*maxmem)-1]
+		var mult int64
+		switch lc {
+		case 'K':
+			mult = 1024
+		case 'M':
+			mult = 1024 * 1024
+		case 'G':
+			mult = 1024 * 1024 * 1024
+		case 'T':
+			mult = 1024 * 1024 * 1024 * 1024
+		default:
+			mult = 1
+		}
+		if mult > 1 {
+			*maxmem = (*maxmem)[:len(*maxmem)-1]
+		}
+		num, err := strconv.ParseInt(*maxmem, 10, 64)
+		if err != nil {
+			log.Println(err)
+		} else {
+			bam.MaxBAMMemory = num * mult
+		}
+	}
 
 	b, err := bam.Load(flag.Arg(0))
 	if err != nil {
