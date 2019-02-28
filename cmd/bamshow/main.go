@@ -61,6 +61,7 @@ func main() {
 		}
 	}
 
+	bam.BAMProgressFunc = bam.StderrProgressFunc
 	b, err := bam.Load(flag.Arg(0))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())

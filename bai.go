@@ -81,6 +81,8 @@ func LoadIndex(filename string) (*Index, error) {
 		nb := int32(le.Uint32(tmp[:4]))
 		r.Bins = make(map[uint32]Bin, nb)
 
+		BAMProgressFunc(float64(i*100) / float64(n))
+
 		for j := int32(0); j < nb; j++ {
 			_, err = io.ReadFull(ff, tmp)
 			if err != nil {
@@ -115,7 +117,7 @@ func LoadIndex(filename string) (*Index, error) {
 		}
 		f.Refs[i] = r
 	}
-
+	BAMProgressFunc(-1.0)
 	return f, err
 }
 

@@ -22,7 +22,28 @@ var (
 	// MaxBAMCachedBlocks is (approximately) how many block to keep in memory.
 	// With default 500MB limit, this value is 8000.
 	MaxBAMCachedBlocks = MaxBAMMemory / 65536
+
+	// BAMProgressFunc is the default ProgressFunc for the bam package.
+	// It is called in a separate goroutine, and by default it does nothing.
+	BAMProgressFunc ProgressFunc = nullProgressFunc
 )
+
+// ProgressFunc is used to report progress during an operation 0.0-100.0
+// A sentinal value of -1.0 is used to indicate the end of processing.
+type ProgressFunc func(percent float64)
+
+func nullProgressFunc(percent float64) {
+}
+
+// StderrProgressFunc reports progress to os.Stderr
+func StderrProgressFunc(percent float64) {
+	if percent < 0.0 {
+		fmt.Fprintf(os.Stderr, "\r Done   \n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\r%7.2f%%", percent)
+	os.Stderr.Sync()
+}
 
 var bgzfEOF = []byte{
 	0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff,
@@ -89,6 +110,7 @@ func Load(filename string) (*AlignmentMap, error) {
 		return nil, err
 	}
 
+	szpct := float64(sz) / 100.0
 	numBlocks := sz / 65535
 	if numBlocks > MaxBAMCachedBlocks {
 		f.blocks = newLRUCache(int(MaxBAMCachedBlocks))
@@ -123,6 +145,7 @@ func Load(filename string) (*AlignmentMap, error) {
 
 		if !f.partial {
 			f.blocks.Set(truepos, data)
+			BAMProgressFunc(float64(truepos) / szpct)
 		}
 
 		if len(remainder) > 0 {
@@ -162,6 +185,7 @@ func Load(filename string) (*AlignmentMap, error) {
 		f.f = nil
 		f.z = nil
 	}
+	BAMProgressFunc(-1.0)
 	f.Index, err = LoadIndex(filename + ".bai")
 	if os.IsNotExist(err) {
 		log.Println("warning: no index available for", filename)
@@ -378,7 +402,6 @@ func parseAlignment(r []byte) *bamAlignment {
 }
 
 func (b *AlignmentMap) loadBlock(bid int64, atoffset uint16) []byte {
-	log.Println("load block ", bid, "at", atoffset)
 	_, err := b.f.Seek(bid, io.SeekStart)
 	if err != nil {
 		panic(err)
@@ -464,17 +487,20 @@ func (b *AlignmentMap) GetMap(refID int32, beginPos, endPos uint64) []string {
 	bid := iref.getBin(beginPos, endPos)
 	bin := iref.Bins[bid]
 
+	bpsum := 0.0
+	bpct := 100.0 / float64(len(bin))
 	for _, chunk := range bin {
 		p1 := chunk.Begin.Compressed()
 		po := chunk.Begin.Uncompressed()
 		p2 := chunk.End.Compressed()
+		bpsum += bpct
+		BAMProgressFunc(bpsum)
 
 		done := false
 		var remainder []byte
 		for pi := p1; pi <= p2; {
 			r, ok := b.blocks.Get(pi)
 			if !ok {
-				log.Println(p1, pi, p2)
 				r = b.loadBlock(pi, po)
 			} else {
 				r = r[po:]
@@ -535,6 +561,7 @@ func (b *AlignmentMap) GetMap(refID int32, beginPos, endPos uint64) []string {
 			po = 0
 		}
 	}
+	BAMProgressFunc(-1.0)
 	return result
 }
 
