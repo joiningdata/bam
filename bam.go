@@ -79,7 +79,7 @@ func Load(filename string) (*AlignmentMap, error) {
 	}
 
 	var remainder []byte
-
+	completeHeader := false
 	truepos := int64(0)
 	for {
 		zr.Multistream(false)
@@ -102,16 +102,19 @@ func Load(filename string) (*AlignmentMap, error) {
 
 		f.blockCache[truepos] = data
 
-		if len(f.blockCache) == 1 {
-			// parse the header + initial block
-			remainder = f.parseHead(data[:])
-		} else {
+		if len(remainder) > 0 {
 			// copy the partial block from the last chunk to
 			// the beginning of this one.
 			newchunk := make([]byte, len(remainder))
 			copy(newchunk, remainder)
-			newchunk = append(newchunk, data...)
-			remainder = f.parseNext(newchunk)
+			data = append(newchunk, data...)
+		}
+
+		if !completeHeader {
+			// parse the header + initial block
+			remainder, completeHeader = f.parseHead(data[:])
+		} else {
+			remainder = f.parseNext(data)
 		}
 
 		// workaround for go bug #30230
@@ -144,24 +147,41 @@ type Reference struct {
 	Length int
 }
 
-func (b *AlignmentMap) parseHead(r []byte) []byte {
+func (b *AlignmentMap) parseHead(r []byte) ([]byte, bool) {
+	// this could be more efficient, but it's only done at the
+	// beginning of the file and takes less than a second for
+	// even fairly large files (including restarts).
 	le := binary.LittleEndian
 
 	headLength := le.Uint32(r[4:])
+	if uint32(len(r)) < 12+headLength {
+		// need more data to parse the header
+		return r, false
+	}
 	b.Header = string(r[8 : 8+headLength])
 	numRefs := int(le.Uint32(r[8+headLength:]))
 
 	offs := 12 + int(headLength)
 	for i := 0; i < numRefs; i++ {
 		br := Reference{}
+		if len(r[offs:]) < 4 {
+			// need to start over with more data for the refs
+			b.References = b.References[:0]
+			return r, false
+		}
 		nameLength := int(le.Uint32(r[offs:]))
+		if len(r[offs+4:]) < (nameLength + 4) {
+			// need to start over with more data for the refs
+			b.References = b.References[:0]
+			return r, false
+		}
 		br.Name = string(r[offs+4 : offs+4+nameLength-1])
 		br.Length = int(le.Uint32(r[offs+4+nameLength:]))
 		b.References = append(b.References, br)
 		offs += 8 + nameLength
 	}
 
-	return b.parseNext(r[offs:])
+	return b.parseNext(r[offs:]), true
 }
 
 func (b *AlignmentMap) parseNext(r []byte) []byte {
