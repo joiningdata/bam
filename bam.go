@@ -538,6 +538,7 @@ func (b *AlignmentMap) GetMap(refID int32, beginPos, endPos uint64) []string {
 	return result
 }
 
+// UnpackSequence expands bit-packed sequence data into readable sequence text.
 func UnpackSequence(packed []byte) string {
 	packmap := []byte("=ACMGRSVTWYHKDBN")
 	var r []byte
