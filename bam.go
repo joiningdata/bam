@@ -65,7 +65,11 @@ func Load(filename string) (*AlignmentMap, error) {
 	if !bytes.Equal(tmp, bgzfEOF) {
 		return nil, fmt.Errorf("invalid end-of-file marker (possibly truncated?)")
 	}
-	ff.Seek(0, io.SeekStart)
+	_, err = ff.Seek(0, io.SeekStart)
+	if err != nil {
+		ff.Close()
+		return nil, err
+	}
 	/////////
 	bff := bufio.NewReader(ff)
 	zr, err := gzip.NewReader(bff)
@@ -189,7 +193,7 @@ type bamAlignment struct {
 	nextPos      int32
 	tlen         int32
 
-	readName    string
+	ReadName    string
 	cigarPacked []uint32
 	seqPacked   []uint8
 	qual        string
@@ -213,7 +217,7 @@ func parseAlignment(r []byte) *bamAlignment {
 	b.nextPos = int32(le.Uint32(r[24:]))
 	b.tlen = int32(le.Uint32(r[28:]))
 	offs := 32 + int(readNameLen)
-	b.readName = string(r[32 : offs-1])
+	b.ReadName = string(r[32 : offs-1])
 
 	b.cigarPacked = make([]uint32, b.cigarOpCount)
 	bb := bytes.NewBuffer(r[offs:])
