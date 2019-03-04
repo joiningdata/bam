@@ -11,6 +11,68 @@ import (
 	"github.com/joiningdata/bam"
 )
 
+type Alphabet struct {
+	sz  int
+	fwd map[rune]int
+	rev []rune
+}
+
+var DNA = &Alphabet{
+	sz: 5,
+	fwd: map[rune]int{
+		' ': 0, 'A': 1, 'C': 2, 'G': 3, 'T': 4,
+	},
+	rev: []rune(" ACGT"),
+}
+
+var RNA = &Alphabet{
+	sz: 5,
+	fwd: map[rune]int{
+		' ': 0, 'A': 1, 'C': 2, 'G': 3, 'U': 4,
+	},
+	rev: []rune(" ACGU"),
+}
+
+func GetConsensus(alignment []string, alphabet *Alphabet) string {
+	con := make([]int, len(alignment[0])*alphabet.sz)
+	for _, row := range alignment {
+		for i, c := range row {
+			con[(i*alphabet.sz)+alphabet.fwd[c]]++
+		}
+	}
+
+	cons := make([]rune, len(alignment[0]))
+	for i := range cons {
+		o := i * alphabet.sz
+		ch := 0
+		best := 0
+		for j := 1; j < alphabet.sz; j++ {
+			if con[o+j] > best {
+				best = con[o+j]
+				ch = j
+			}
+		}
+		cons[i] = alphabet.rev[ch]
+	}
+	return string(cons)
+}
+
+func GetDiff(ref, aligned string) string {
+	diff := make([]byte, len(ref))
+	for i, c := range []byte(ref) {
+		if aligned[i] == ' ' {
+			diff[i] = ' '
+			continue
+		}
+		if c == aligned[i] {
+			diff[i] = '='
+		} else {
+			diff[i] = aligned[i]
+		}
+	}
+	return string(diff)
+}
+
 func commas(n int) string {
 	s := fmt.Sprint(n)
 	r := len(s) % 3
@@ -110,8 +172,15 @@ func main() {
 		os.Exit(0)
 	}
 
+	fmt.Fprintf(os.Stderr, "Getting alignment...\n")
 	data := b.GetMap(int32(refID), uint64(*startPos), uint64(*endPos))
+
+	fmt.Fprintf(os.Stderr, "Determining consensus...\n")
+	constr := GetConsensus(data, DNA)
+	fmt.Fprintf(os.Stderr, " Done\n")
+
+	fmt.Println(len(constr), constr)
 	for _, row := range data {
-		fmt.Println(len(row), row)
+		fmt.Println(len(row), GetDiff(constr, row))
 	}
 }
